@@ -22,8 +22,25 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Make Maven wrapper executable
-        run: chmod +x mvnw
+      - name: Make scripts executable
+        run: |
+          chmod +x mvnw
+          chmod +x benchmarks/run-benchmarks.sh
 
       - name: Compile and run test suite
         run: ./mvnw clean test
+
+      - name: Package production JAR
+        run: ./mvnw package -DskipTests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify production Docker build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: api-rate-limiter:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
