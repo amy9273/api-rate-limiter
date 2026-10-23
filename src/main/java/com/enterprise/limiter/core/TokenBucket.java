@@ -191,6 +191,33 @@ public class TokenBucket {
     }
 
     /**
+     * Calculates the Unix epoch seconds timestamp when the bucket will be completely
+     * replenished back to full capacity.
+     *
+     * @return epoch seconds timestamp
+     */
+    public long calculateResetEpochSeconds() {
+        return calculateResetEpochSeconds(System.currentTimeMillis() / 1000L);
+    }
+
+    /**
+     * Calculates the Unix epoch seconds timestamp when the bucket will be completely
+     * replenished back to full capacity, based on the provided current epoch seconds.
+     *
+     * @param nowEpochSeconds reference current epoch timestamp in seconds
+     * @return epoch seconds timestamp when fully refilled
+     */
+    public long calculateResetEpochSeconds(long nowEpochSeconds) {
+        long currentTokens = getAvailableTokens();
+        if (currentTokens >= capacity || refillTokensPerSecond <= 0) {
+            return nowEpochSeconds;
+        }
+        long deficit = capacity - currentTokens;
+        long secondsToFull = (long) Math.ceil((double) deficit / refillTokensPerSecond);
+        return nowEpochSeconds + secondsToFull;
+    }
+
+    /**
      * Internal mathematical refill operation.
      *
      * <p>Carries forward sub-token fractional nanoseconds to prevent drift or token loss
