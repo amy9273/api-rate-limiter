@@ -8,6 +8,13 @@ spring:
     virtual:
       enabled: true
 
+rate-limiter:
+  default-capacity: 50
+  default-refill-rate: 10
+  bucket-ttl: 10m
+  cleanup-interval: 60s
+  cleanup-enabled: true
+
 management:
   endpoints:
     web:

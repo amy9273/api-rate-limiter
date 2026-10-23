@@ -34,6 +34,10 @@ public class TestNanoClock implements NanoClock {
         advanceNanos(seconds * 1_000_000_000L);
     }
 
+    public void advanceMinutes(long minutes) {
+        advanceSeconds(minutes * 60L);
+    }
+
     public void setNanos(long nanos) {
         currentNanos.set(nanos);
     }
