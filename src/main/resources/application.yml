@@ -15,6 +15,11 @@ rate-limiter:
   cleanup-interval: 60s
   cleanup-enabled: true
 
+proxy:
+  target-url: http://localhost:8081
+  connect-timeout: 5s
+  read-timeout: 10s
+
 management:
   endpoints:
     web:
