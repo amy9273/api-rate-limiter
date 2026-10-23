@@ -65,6 +65,16 @@ public class BucketRegistry {
     }
 
     /**
+     * Retrieves or creates the ClientBucketEntry using default capacity and refill rate.
+     *
+     * @param clientKey unique client identifier
+     * @return ClientBucketEntry holding the bucket and access timestamp
+     */
+    public ClientBucketEntry getOrCreateEntry(String clientKey) {
+        return getOrCreateEntry(clientKey, properties.getDefaultCapacity(), properties.getDefaultRefillRate());
+    }
+
+    /**
      * Retrieves or creates a TokenBucket for the given client key with custom capacity and refill rate.
      *
      * @param clientKey unique client identifier
