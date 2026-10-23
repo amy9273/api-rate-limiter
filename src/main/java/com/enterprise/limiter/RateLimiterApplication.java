@@ -32,11 +32,13 @@ public class RateLimiterApplication {
             String defaultCapacity = env.getProperty("rate-limiter.default-capacity", "50");
             String defaultRefill = env.getProperty("rate-limiter.default-refill-rate", "10");
             String ttl = env.getProperty("rate-limiter.bucket-ttl", "10m");
+            String upstream = env.getProperty("proxy.target-url", "http://localhost:8081");
 
             log.info("==================================================================");
             log.info("  HIGH-THROUGHPUT API RATE LIMITER & REVERSE PROXY");
             log.info("==================================================================");
             log.info("  Active Listen Port      : {}", port);
+            log.info("  Upstream Target URL     : {}", upstream);
             log.info("  Virtual Threading (Loom): {}", virtualThreadsEnabled ? "ENABLED (Java 21 Project Loom)" : "DISABLED");
             log.info("  Prometheus Metrics URI  : /actuator/prometheus");
             log.info("  Default Rate Limit Rule : Capacity: {} | Refill: {} tokens/sec", defaultCapacity, defaultRefill);
