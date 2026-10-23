@@ -1,0 +1,30 @@
+# Java & Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE & Editor
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Logs & Environment
+*.log
+.env
+.env.local
+
+# OS Metadata
+.DS_Store
+Thumbs.db
