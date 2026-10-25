@@ -112,6 +112,8 @@ class RateLimitingFilterTest {
         assertThat(json.get("limit").asInt()).isEqualTo(5);
         assertThat(json.get("remaining").asInt()).isEqualTo(0);
         assertThat(json.get("retryAfterSeconds").asLong()).isGreaterThanOrEqualTo(1L);
+        assertThat(rejectedRes.getHeader(RateLimitingFilter.HEADER_RETRY_AFTER))
+                .isEqualTo(json.get("retryAfterSeconds").asText());
 
         double rejectedCount = meterRegistry.get("rate_limiter_requests_total")
                 .tag("status", "rejected").counter().count();

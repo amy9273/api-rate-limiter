@@ -1,8 +1,10 @@
 package com.enterprise.limiter.proxy;
 
 import com.enterprise.limiter.config.ProxyProperties;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import jakarta.annotation.PreDestroy;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
@@ -11,6 +13,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -24,8 +27,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Enumeration;
-import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.Executors;
@@ -33,6 +36,15 @@ import java.util.concurrent.Executors;
 /**
  * Non-blocking, high-throughput reverse proxy service streaming HTTP requests
  * directly to upstream services via Java 21 virtual threads.
+ *
+ * <p>Hardened features:
+ * <ul>
+ *   <li>Excludes restricted JDK headers (including {@code Expect}) from forwarding (CD-02).</li>
+ *   <li>Safely encodes URIs with special characters and handles malformed inputs (LD-01).</li>
+ *   <li>Rewrites upstream {@code Location} redirect headers to relative paths, preventing topology leakage (LD-04).</li>
+ *   <li>Serializes RFC 7807 error responses with Jackson {@code ObjectMapper} to eliminate JSON injection (CD-04).</li>
+ *   <li>Releases {@code HttpClient} resources gracefully on shutdown via {@code @PreDestroy} (PR-03).</li>
+ * </ul>
  */
 @Service
 public class ReverseProxyService {
@@ -49,21 +61,43 @@ public class ReverseProxyService {
             "transfer-encoding",
             "upgrade",
             "host",
-            "content-length"
+            "content-length",
+            "expect"
     );
 
     private final ProxyProperties properties;
     private final HttpClient httpClient;
+    private final ObjectMapper objectMapper;
     private final Timer proxyLatencyTimer;
 
-    @Autowired
-    public ReverseProxyService(ProxyProperties properties, @Autowired(required = false) MeterRegistry meterRegistry) {
-        this(properties, createDefaultHttpClient(properties), meterRegistry);
+    public ReverseProxyService(ProxyProperties properties) {
+        this(properties, new ObjectMapper(), null);
+    }
+
+    public ReverseProxyService(ProxyProperties properties, MeterRegistry meterRegistry) {
+        this(properties, new ObjectMapper(), meterRegistry);
     }
 
     public ReverseProxyService(ProxyProperties properties, HttpClient httpClient, MeterRegistry meterRegistry) {
+        this(properties, httpClient, new ObjectMapper(), meterRegistry);
+    }
+
+    @Autowired
+    public ReverseProxyService(
+            ProxyProperties properties,
+            ObjectMapper objectMapper,
+            @Autowired(required = false) MeterRegistry meterRegistry) {
+        this(properties, createDefaultHttpClient(properties), objectMapper, meterRegistry);
+    }
+
+    public ReverseProxyService(
+            ProxyProperties properties,
+            HttpClient httpClient,
+            ObjectMapper objectMapper,
+            MeterRegistry meterRegistry) {
         this.properties = properties;
         this.httpClient = httpClient;
+        this.objectMapper = objectMapper != null ? objectMapper : new ObjectMapper();
 
         if (meterRegistry != null) {
             this.proxyLatencyTimer = Timer.builder("rate_limiter_proxy_latency_seconds")
@@ -84,6 +118,14 @@ public class ReverseProxyService {
                 .build();
     }
 
+    @PreDestroy
+    public void close() {
+        if (httpClient != null) {
+            httpClient.close();
+            log.info("Closed reverse proxy HttpClient and released carrier resources.");
+        }
+    }
+
     /**
      * Proxies the incoming client request to the upstream target service and streams
      * the upstream response back to the client.
@@ -94,7 +136,16 @@ public class ReverseProxyService {
      */
     public void proxyRequest(HttpServletRequest request, HttpServletResponse response) throws IOException {
         long startTimeNanos = System.nanoTime();
-        URI upstreamUri = buildUpstreamUri(request);
+
+        URI upstreamUri;
+        try {
+            upstreamUri = buildUpstreamUri(request);
+        } catch (IllegalArgumentException e) {
+            log.warn("Malformed request URI syntax [{}]: {}", request.getRequestURI(), e.getMessage());
+            sendErrorResponse(response, HttpStatus.BAD_REQUEST.value(), "Bad Request",
+                    "Malformed request URI syntax", request.getRequestURI());
+            return;
+        }
 
         HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                 .uri(upstreamUri)
@@ -148,8 +199,12 @@ public class ReverseProxyService {
         }
         String path = request.getRequestURI();
         String query = request.getQueryString();
-        String fullUri = base + path + (query != null && !query.isBlank() ? "?" + query : "");
-        return URI.create(fullUri);
+
+        UriComponentsBuilder builder = UriComponentsBuilder.fromUriString(base).path(path);
+        if (query != null && !query.isBlank()) {
+            builder.replaceQuery(query);
+        }
+        return builder.build().encode().toUri();
     }
 
     private void copyRequestHeaders(HttpServletRequest request, HttpRequest.Builder builder) {
@@ -175,7 +230,7 @@ public class ReverseProxyService {
             }
         }
 
-        // Preserve and append verified client IP to X-Forwarded-For
+        // Preserve and append verified socket remote IP to X-Forwarded-For
         String clientIp = request.getRemoteAddr();
         String updatedForwardedFor = (existingForwardedFor != null && !existingForwardedFor.isBlank())
                 ? existingForwardedFor + ", " + clientIp
@@ -198,15 +253,42 @@ public class ReverseProxyService {
     }
 
     private void copyResponseHeaders(HttpResponse<?> upstreamResponse, HttpServletResponse response) {
+        String base = properties.getTargetUrl();
+        String baseNormalized = base.endsWith("/") ? base.substring(0, base.length() - 1) : base;
+
         upstreamResponse.headers().map().forEach((name, values) -> {
             String lower = name.toLowerCase(Locale.ROOT);
             if (!HOP_BY_HOP_HEADERS.contains(lower)) {
                 for (String value : values) {
+                    if ("location".equals(lower)) {
+                        value = rewriteLocationHeader(value, baseNormalized);
+                    }
                     response.addHeader(name, value);
                 }
             }
         });
     }
+
+    private String rewriteLocationHeader(String location, String upstreamBase) {
+        if (location == null || location.isBlank()) {
+            return location;
+        }
+        // If upstream returned absolute URL pointing to internal upstream, rewrite to relative path
+        if (location.startsWith(upstreamBase)) {
+            String relative = location.substring(upstreamBase.length());
+            return relative.isEmpty() ? "/" : relative;
+        }
+        return location;
+    }
+
+    public record ProxyProblemDetail(
+            String type,
+            String title,
+            int status,
+            String detail,
+            String instance,
+            String timestamp
+    ) {}
 
     private void sendErrorResponse(
             HttpServletResponse response,
@@ -219,12 +301,16 @@ public class ReverseProxyService {
         response.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
 
-        String json = String.format(
-                "{\"type\":\"https://api.gateway.enterprise.com/errors/proxy-error\",\"title\":\"%s\",\"status\":%d,\"detail\":\"%s\",\"instance\":\"%s\"}",
-                title, status, detail, instance
+        ProxyProblemDetail problem = new ProxyProblemDetail(
+                "https://api.gateway.enterprise.com/errors/proxy-error",
+                title,
+                status,
+                detail,
+                instance,
+                Instant.now().toString()
         );
 
-        response.getWriter().write(json);
+        objectMapper.writeValue(response.getWriter(), problem);
         response.getWriter().flush();
     }
 }
