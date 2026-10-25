@@ -3,6 +3,8 @@ package com.enterprise.limiter.proxy;
 import com.enterprise.limiter.config.ProxyProperties;
 import com.sun.net.httpserver.HttpServer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -156,5 +158,84 @@ class ReverseProxyServiceTest {
         assertThat(response.getStatus()).isEqualTo(504);
         assertThat(response.getContentType()).startsWith("application/problem+json");
         assertThat(response.getContentAsString()).contains("Gateway Timeout");
+    }
+
+    @Test
+    @DisplayName("Should exclude Expect header from forwarded headers to avoid JDK restricted header crash")
+    void shouldExcludeExpectHeaderFromForwarding() throws IOException {
+        AtomicBoolean upstreamCalled = new AtomicBoolean(false);
+
+        upstreamServer.createContext("/v1/upload", exchange -> {
+            upstreamCalled.set(true);
+            exchange.sendResponseHeaders(200, 0);
+            exchange.close();
+        });
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/v1/upload");
+        request.addHeader("Expect", "100-continue");
+        request.setContent("payload".getBytes(StandardCharsets.UTF_8));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        proxyService.proxyRequest(request, response);
+
+        assertThat(response.getStatus()).isEqualTo(200);
+        assertThat(upstreamCalled.get()).isTrue();
+    }
+
+    @Test
+    @DisplayName("Should safely encode special characters in query string without crashing")
+    void shouldSafelyEncodeSpecialCharactersInQuery() throws IOException {
+        AtomicReference<String> receivedQuery = new AtomicReference<>();
+
+        upstreamServer.createContext("/v1/search", exchange -> {
+            receivedQuery.set(exchange.getRequestURI().getRawQuery());
+            exchange.sendResponseHeaders(200, 0);
+            exchange.close();
+        });
+
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/v1/search");
+        request.setQueryString("q=alpha|beta&filter={status:active}");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        proxyService.proxyRequest(request, response);
+
+        assertThat(response.getStatus()).isEqualTo(200);
+        assertThat(receivedQuery.get()).contains("alpha%7Cbeta");
+    }
+
+    @Test
+    @DisplayName("Should serialize RFC 7807 error responses using Jackson escaping malicious URIs")
+    void shouldSerializeErrorResponsesSafelyWithoutJsonInjection() throws IOException {
+        upstreamServer.stop(0); // Force 502
+
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/v1/injected\"};\nmalicious");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        proxyService.proxyRequest(request, response);
+
+        assertThat(response.getStatus()).isEqualTo(502);
+        ObjectMapper mapper = new ObjectMapper();
+        // Jackson must successfully parse the response body without syntax error
+        JsonNode json = mapper.readTree(response.getContentAsString());
+        assertThat(json.get("status").asInt()).isEqualTo(502);
+        assertThat(json.get("instance").asText()).isEqualTo("/v1/injected\"};\nmalicious");
+    }
+
+    @Test
+    @DisplayName("Should rewrite upstream Location redirect headers to relative paths")
+    void shouldRewriteUpstreamLocationHeader() throws IOException {
+        upstreamServer.createContext("/v1/redirect", exchange -> {
+            exchange.getResponseHeaders().set("Location", "http://localhost:" + upstreamPort + "/v1/login?ref=dashboard");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/v1/redirect");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        proxyService.proxyRequest(request, response);
+
+        assertThat(response.getStatus()).isEqualTo(302);
+        assertThat(response.getHeader("Location")).isEqualTo("/v1/login?ref=dashboard");
     }
 }

@@ -3,6 +3,7 @@ package com.enterprise.limiter.filter;
 import com.enterprise.limiter.core.BucketRegistry;
 import com.enterprise.limiter.core.ClientBucketEntry;
 import com.enterprise.limiter.core.ClientKeyResolver;
+import com.enterprise.limiter.core.ConsumptionResult;
 import com.enterprise.limiter.core.TokenBucket;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
@@ -95,18 +96,15 @@ public class RateLimitingFilter extends OncePerRequestFilter {
         TokenBucket bucket = entry.getBucket();
 
         long nowEpochSeconds = Instant.now().getEpochSecond();
+        ConsumptionResult snapshot = bucket.tryConsumeSnapshot(1L, nowEpochSeconds);
         long capacity = bucket.getCapacity();
 
-        boolean acquired = bucket.tryConsume(1L);
-        long remaining = bucket.getAvailableTokens();
-        long resetEpochSeconds = bucket.calculateResetEpochSeconds(nowEpochSeconds);
-
-        // RFC 6585 headers must be present on ALL responses
+        // RFC 6585 headers must be present on ALL responses from the synchronized snapshot
         response.setHeader(HEADER_LIMIT, String.valueOf(capacity));
-        response.setHeader(HEADER_REMAINING, String.valueOf(remaining));
-        response.setHeader(HEADER_RESET, String.valueOf(resetEpochSeconds));
+        response.setHeader(HEADER_REMAINING, String.valueOf(snapshot.remainingTokens()));
+        response.setHeader(HEADER_RESET, String.valueOf(snapshot.resetEpochSeconds()));
 
-        if (acquired) {
+        if (snapshot.allowed()) {
             if (allowedRequestsCounter != null) {
                 allowedRequestsCounter.increment();
             }
@@ -116,14 +114,14 @@ public class RateLimitingFilter extends OncePerRequestFilter {
                 rejectedRequestsCounter.increment();
             }
 
-            long retryAfterSeconds = Math.max(1L, bucket.calculateRetryAfterSeconds());
+            long retryAfterSeconds = Math.max(1L, snapshot.retryAfterSeconds());
             response.setHeader(HEADER_RETRY_AFTER, String.valueOf(retryAfterSeconds));
             response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
             response.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
             response.setCharacterEncoding(StandardCharsets.UTF_8.name());
 
             log.warn("Client [{}] exceeded quota on URI [{}]. Capacity: {}, Remaining: {}. Returning HTTP 429 (Retry-After: {}s).",
-                    clientKey, request.getRequestURI(), capacity, remaining, retryAfterSeconds);
+                    clientKey, request.getRequestURI(), capacity, snapshot.remainingTokens(), retryAfterSeconds);
 
             String detail = String.format(
                     "Rate limit exceeded. Your bucket capacity is %d requests with a refill rate of %d requests/second.",
@@ -138,8 +136,8 @@ public class RateLimitingFilter extends OncePerRequestFilter {
                     request.getRequestURI(),
                     retryAfterSeconds,
                     capacity,
-                    remaining,
-                    resetEpochSeconds
+                    snapshot.remainingTokens(),
+                    snapshot.resetEpochSeconds()
             );
 
             objectMapper.writeValue(response.getWriter(), error);
