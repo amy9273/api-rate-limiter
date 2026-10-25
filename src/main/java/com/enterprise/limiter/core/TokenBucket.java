@@ -10,10 +10,14 @@ import java.util.concurrent.atomic.AtomicReference;
  * Compare-And-Swap (CAS) via {@link AtomicReference}. No mutexes, synchronized blocks,
  * or locks are held on the token acquisition hot path, eliminating thread contention
  * even under 100,000+ concurrent requests.
+ *
+ * <p>Emits immutable {@link ConsumptionResult} snapshots directly from the atomic
+ * CAS state transition to guarantee zero state skew across HTTP status codes and headers.
  */
 public class TokenBucket {
 
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final long MAX_SAFE_TOKENS_FOR_MULTIPLICATION = Long.MAX_VALUE / NANOS_PER_SECOND;
 
     private final long capacity;
     private final long refillTokensPerSecond;
@@ -67,7 +71,7 @@ public class TokenBucket {
     }
 
     /**
-     * Attempts to consume a single token.
+     * Attempts to consume a single token, returning true if acquired.
      *
      * @return true if token was acquired, false if rate limit exceeded
      */
@@ -82,11 +86,43 @@ public class TokenBucket {
      * @return true if tokens were acquired, false if rate limit exceeded
      */
     public boolean tryConsume(long tokens) {
+        return tryConsumeSnapshot(tokens).allowed();
+    }
+
+    /**
+     * Attempts to consume a single token and returns an atomic point-in-time snapshot.
+     *
+     * @return atomic consumption result snapshot
+     */
+    public ConsumptionResult tryConsumeSnapshot() {
+        return tryConsumeSnapshot(1L);
+    }
+
+    /**
+     * Attempts to consume the specified tokens and returns an atomic point-in-time snapshot,
+     * using the current system epoch seconds as the reference for reset time calculation.
+     *
+     * @param tokens number of tokens requested (must be > 0)
+     * @return atomic consumption result snapshot
+     */
+    public ConsumptionResult tryConsumeSnapshot(long tokens) {
+        return tryConsumeSnapshot(tokens, System.currentTimeMillis() / 1000L);
+    }
+
+    /**
+     * Attempts to consume the specified number of tokens atomically, returning an immutable
+     * point-in-time snapshot calculated directly during the atomic CAS loop.
+     *
+     * <p>Guarantees that {@code remainingTokens}, {@code retryAfterSeconds}, and {@code resetEpochSeconds}
+     * are perfectly synchronized with the acquisition decision without thread races or state skew.
+     *
+     * @param tokens number of tokens requested (must be > 0)
+     * @param nowEpochSeconds current epoch time in seconds for reset calculation
+     * @return atomic consumption result snapshot
+     */
+    public ConsumptionResult tryConsumeSnapshot(long tokens, long nowEpochSeconds) {
         if (tokens <= 0) {
             throw new IllegalArgumentException("Tokens to consume must be greater than 0: " + tokens);
-        }
-        if (tokens > capacity) {
-            return false;
         }
 
         while (true) {
@@ -94,12 +130,18 @@ public class TokenBucket {
             BucketState current = stateRef.get();
             BucketState refilled = refill(current, nowNanos);
 
-            if (refilled.availableTokens() < tokens) {
-                // Insufficient tokens. Opportunistically update state if refill generated tokens.
+            if (tokens > capacity || refilled.availableTokens() < tokens) {
+                // Insufficient tokens. Opportunistically publish refilled tokens if state advanced.
                 if (refilled != current) {
                     stateRef.compareAndSet(current, refilled);
                 }
-                return false;
+
+                long remaining = refilled.availableTokens();
+                long nanosUntilNext = calculateNanosUntilTokensInternal(1L, refilled, nowNanos);
+                long retryAfter = calculateRetryAfterSecondsInternal(nanosUntilNext);
+                long resetEpoch = calculateResetEpochSecondsInternal(remaining, nowEpochSeconds);
+
+                return new ConsumptionResult(false, remaining, nanosUntilNext, retryAfter, resetEpoch);
             }
 
             BucketState updated = new BucketState(
@@ -108,7 +150,10 @@ public class TokenBucket {
             );
 
             if (stateRef.compareAndSet(current, updated)) {
-                return true;
+                long remaining = updated.availableTokens();
+                long resetEpoch = calculateResetEpochSecondsInternal(remaining, nowEpochSeconds);
+
+                return new ConsumptionResult(true, remaining, 0L, 0L, resetEpoch);
             }
             // CAS failed due to concurrent modification by another thread; retry loop immediately.
         }
@@ -147,29 +192,34 @@ public class TokenBucket {
      * @return nanoseconds to wait, 0 if already available, or Long.MAX_VALUE if impossible
      */
     public long calculateNanosUntilTokens(long tokensNeeded) {
-        if (tokensNeeded <= 0) {
-            return 0L;
-        }
-        if (tokensNeeded > capacity) {
-            return Long.MAX_VALUE;
-        }
-
         long nowNanos = clock.nanoTime();
         BucketState current = stateRef.get();
         BucketState refilled = refill(current, nowNanos);
+        return calculateNanosUntilTokensInternal(tokensNeeded, refilled, nowNanos);
+    }
 
-        if (refilled.availableTokens() >= tokensNeeded) {
+    private long calculateNanosUntilTokensInternal(long tokensNeeded, BucketState state, long nowNanos) {
+        if (tokensNeeded <= 0) {
+            return 0L;
+        }
+        if (tokensNeeded > capacity || refillTokensPerSecond == 0) {
+            return Long.MAX_VALUE;
+        }
+        if (state.availableTokens() >= tokensNeeded) {
             return 0L;
         }
 
-        if (refillTokensPerSecond == 0) {
-            return Long.MAX_VALUE;
+        long deficit = tokensNeeded - state.availableTokens();
+        long elapsedNanos = Math.max(0L, nowNanos - state.lastRefillNanos());
+
+        long nanosForDeficit;
+        if (deficit > MAX_SAFE_TOKENS_FOR_MULTIPLICATION) {
+            nanosForDeficit = Long.MAX_VALUE;
+        } else {
+            nanosForDeficit = (long) Math.ceil((deficit * (double) NANOS_PER_SECOND) / refillTokensPerSecond);
         }
 
-        long deficit = tokensNeeded - refilled.availableTokens();
-        long elapsedNanos = Math.max(0L, nowNanos - refilled.lastRefillNanos());
-        long nanosPerToken = (long) Math.ceil((deficit * (double) NANOS_PER_SECOND) / refillTokensPerSecond);
-        long remainingNanos = nanosPerToken - elapsedNanos;
+        long remainingNanos = nanosForDeficit - elapsedNanos;
         return Math.max(0L, remainingNanos);
     }
 
@@ -180,14 +230,17 @@ public class TokenBucket {
      * @return seconds to wait (minimum 1 second if empty)
      */
     public long calculateRetryAfterSeconds() {
-        long nanosRemaining = calculateNanosUntilNextToken();
+        return calculateRetryAfterSecondsInternal(calculateNanosUntilNextToken());
+    }
+
+    private long calculateRetryAfterSecondsInternal(long nanosRemaining) {
         if (nanosRemaining == 0L) {
             return 0L;
         }
         if (nanosRemaining == Long.MAX_VALUE) {
             return 60L; // Default backoff if unrefillable
         }
-        return (long) Math.ceil(nanosRemaining / (double) NANOS_PER_SECOND);
+        return Math.max(1L, (long) Math.ceil(nanosRemaining / (double) NANOS_PER_SECOND));
     }
 
     /**
@@ -208,7 +261,10 @@ public class TokenBucket {
      * @return epoch seconds timestamp when fully refilled
      */
     public long calculateResetEpochSeconds(long nowEpochSeconds) {
-        long currentTokens = getAvailableTokens();
+        return calculateResetEpochSecondsInternal(getAvailableTokens(), nowEpochSeconds);
+    }
+
+    private long calculateResetEpochSecondsInternal(long currentTokens, long nowEpochSeconds) {
         if (currentTokens >= capacity || refillTokensPerSecond <= 0) {
             return nowEpochSeconds;
         }
@@ -221,7 +277,7 @@ public class TokenBucket {
      * Internal mathematical refill operation.
      *
      * <p>Carries forward sub-token fractional nanoseconds to prevent drift or token loss
-     * over high-frequency access patterns, while guarding against integer overflow.
+     * over high-frequency access patterns, while rigorously guarding against 64-bit integer overflow.
      */
     private BucketState refill(BucketState current, long nowNanos) {
         long elapsedNanos = nowNanos - current.lastRefillNanos();
@@ -234,16 +290,35 @@ public class TokenBucket {
         }
 
         long tokensDeficit = capacity - current.availableTokens();
-        long nanosToFull = (tokensDeficit * NANOS_PER_SECOND) / refillTokensPerSecond;
+
+        // Guard against 64-bit integer overflow: tokensDeficit * NANOS_PER_SECOND
+        long nanosToFull;
+        if (tokensDeficit > MAX_SAFE_TOKENS_FOR_MULTIPLICATION) {
+            nanosToFull = Long.MAX_VALUE;
+        } else {
+            nanosToFull = (tokensDeficit * NANOS_PER_SECOND) / refillTokensPerSecond;
+        }
 
         if (elapsedNanos >= nanosToFull) {
             return new BucketState(capacity, nowNanos);
         }
 
-        long tokensToAdd = (elapsedNanos * refillTokensPerSecond) / NANOS_PER_SECOND;
+        // Guard against overflow when calculating tokensToAdd:
+        long tokensToAdd;
+        if (elapsedNanos > Long.MAX_VALUE / refillTokensPerSecond) {
+            tokensToAdd = capacity;
+        } else {
+            tokensToAdd = (elapsedNanos * refillTokensPerSecond) / NANOS_PER_SECOND;
+        }
+
         if (tokensToAdd > 0) {
             long newTokens = Math.min(capacity, current.availableTokens() + tokensToAdd);
-            long nanosConsumed = (tokensToAdd * NANOS_PER_SECOND) / refillTokensPerSecond;
+            long nanosConsumed;
+            if (tokensToAdd > MAX_SAFE_TOKENS_FOR_MULTIPLICATION) {
+                nanosConsumed = elapsedNanos;
+            } else {
+                nanosConsumed = (tokensToAdd * NANOS_PER_SECOND) / refillTokensPerSecond;
+            }
             long newLastRefillNanos = (newTokens >= capacity)
                     ? nowNanos
                     : (current.lastRefillNanos() + nanosConsumed);
