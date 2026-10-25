@@ -8,13 +8,17 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @DisplayName("BucketRegistry Specification & TTL Eviction Tests")
 class BucketRegistryTest {
@@ -149,8 +153,8 @@ class BucketRegistryTest {
     class ConcurrencyTests {
 
         @Test
-        @DisplayName("100 concurrent threads creating and consuming tokens across hundreds of client keys")
-        void shouldHandle100ConcurrentThreadsSafely() throws InterruptedException {
+        @DisplayName("100 concurrent threads creating and consuming tokens across 50 keys: exactly 2,500 succeed")
+        void shouldHandle100ConcurrentThreadsSafely() throws Exception {
             final int threadCount = 100;
             final int uniqueKeys = 50;
             final int operationsPerThread = 50;
@@ -159,32 +163,110 @@ class BucketRegistryTest {
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(threadCount);
             AtomicInteger totalSuccessfulConsumptions = new AtomicInteger(0);
+            List<Future<?>> futures = new ArrayList<>();
 
             for (int i = 0; i < threadCount; i++) {
                 final int threadId = i;
-                executor.submit(() -> {
+                futures.add(executor.submit(() -> {
+                    startLatch.await();
                     try {
-                        startLatch.await();
                         for (int op = 0; op < operationsPerThread; op++) {
                             String key = "client_" + ((threadId + op) % uniqueKeys);
                             if (registry.tryConsume(key)) {
                                 totalSuccessfulConsumptions.incrementAndGet();
                             }
                         }
-                    } catch (Exception e) {
-                        e.printStackTrace();
                     } finally {
                         doneLatch.countDown();
                     }
-                });
+                    return null;
+                }));
             }
 
             startLatch.countDown();
             assertThat(doneLatch.await(10, TimeUnit.SECONDS)).isTrue();
+            for (Future<?> f : futures) {
+                f.get(10, TimeUnit.SECONDS); // Propagate any asynchronous exceptions
+            }
             executor.shutdown();
 
             assertThat(registry.getActiveBucketCount()).isEqualTo(uniqueKeys);
-            assertThat(totalSuccessfulConsumptions.get()).isGreaterThan(0);
+            // 50 keys with 50 tokens each = exactly 2,500 tokens consumed with zero time advance
+            assertThat(totalSuccessfulConsumptions.get())
+                    .as("Exactly 2,500 requests must succeed across 50 keys with capacity 50")
+                    .isEqualTo(2_500);
+
+            for (int k = 0; k < uniqueKeys; k++) {
+                assertThat(registry.getOrCreate("client_" + k).getAvailableTokens()).isEqualTo(0);
+            }
+        }
+
+        @Test
+        @DisplayName("Should enforce max active buckets capacity and shed excess ephemeral clients")
+        void shouldEnforceMaxActiveBucketsCapacity() {
+            RateLimiterProperties boundedProps = new RateLimiterProperties(50, 10, Duration.ofMinutes(10), Duration.ofSeconds(60), true, 3);
+            SimpleMeterRegistry mr = new SimpleMeterRegistry();
+            BucketRegistry boundedRegistry = new BucketRegistry(boundedProps, clock, mr);
+
+            boundedRegistry.getOrCreate("client_1");
+            boundedRegistry.getOrCreate("client_2");
+            boundedRegistry.getOrCreate("client_3");
+            assertThat(boundedRegistry.getActiveBucketCount()).isEqualTo(3);
+
+            // 4th client exceeds capacity of 3 with none expired yet
+            assertThatThrownBy(() -> boundedRegistry.getOrCreate("client_4"))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("capacity exceeded");
+
+            double overflowCount = mr.get("rate_limiter_registry_overflow_total").counter().count();
+            assertThat(overflowCount).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("Concurrent eviction sweeps racing with client acquisitions execute with zero race exceptions")
+        void shouldSafelyHandleConcurrentEvictionAndAccess() throws Exception {
+            final int clientCount = 50;
+            for (int i = 0; i < clientCount; i++) {
+                registry.getOrCreate("stale_" + i);
+            }
+            assertThat(registry.getActiveBucketCount()).isEqualTo(clientCount);
+
+            // Advance clock past TTL (11 minutes) so they become eligible for eviction
+            clock.advanceMinutes(11);
+
+            ExecutorService executor = Executors.newFixedThreadPool(8);
+            CountDownLatch startLatch = new CountDownLatch(1);
+            List<Future<?>> futures = new ArrayList<>();
+
+            // 4 threads performing eviction sweeps
+            for (int i = 0; i < 4; i++) {
+                futures.add(executor.submit(() -> {
+                    startLatch.await();
+                    registry.evictExpiredBuckets();
+                    return null;
+                }));
+            }
+
+            // 4 threads concurrently accessing and creating fresh buckets
+            for (int i = 0; i < 4; i++) {
+                final int threadId = i;
+                futures.add(executor.submit(() -> {
+                    startLatch.await();
+                    for (int j = 0; j < 25; j++) {
+                        registry.tryConsume("active_" + (threadId * 25 + j));
+                    }
+                    return null;
+                }));
+            }
+
+            startLatch.countDown();
+            for (Future<?> f : futures) {
+                f.get(10, TimeUnit.SECONDS);
+            }
+            executor.shutdown();
+
+            // All 100 new active entries should be successfully recorded without deadlocks
+            assertThat(registry.getActiveBucketCount()).isGreaterThanOrEqualTo(100);
         }
     }
 }
