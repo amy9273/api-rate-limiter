@@ -14,7 +14,7 @@ Current project state, implementation roadmap, and completion status.
 | **Unit 04** | High-Throughput Reverse Proxy Forwarding | Non-blocking proxy forwarding to upstream (b2b-saas-billing), streaming bodies | ✅ Complete |
 | **Unit 05** | Production Docker, CI/CD & JMH/Load Benchmark | JMH microbenchmarks, wrk/k6 load testing script, multi-stage Dockerfile | ✅ Complete |
 | **Unit 06** | Token Bucket Hardening, Math Precision & Atomic Snapshots | Fix 64-bit overflow, atomic ConsumptionResult snapshot, safe refill math | ✅ Complete |
-| **Unit 07** | Registry Optimization & Virtual Thread Pinning Remediation | Lock-free getOrCreateEntry, eliminate carrier pinning, memory bounds | 📋 Planned |
+| **Unit 07** | Registry Optimization & Virtual Thread Pinning Remediation | Lock-free getOrCreateEntry, eliminate carrier pinning, memory bounds | ✅ Complete |
 | **Unit 08** | Client Identity Security & Proxy Trust Chains | Trusted proxy CIDRs, X-Forwarded-For verification, key sanitization | 📋 Planned |
 | **Unit 09** | HTTP RFC 6585/7807 Semantics & Reverse Proxy Hardening | Header synchronization, Expect header fix, JSON injection fix, safe URI | 📋 Planned |
 
@@ -30,6 +30,7 @@ Current project state, implementation roadmap, and completion status.
 - **2026-10-23**: **Unit 05 Complete**. Implemented multi-stage production Dockerfile (`eclipse-temurin:21-jre-alpine` with non-root `appuser:appgroup` and layered JAR extraction), JMH microbenchmark harness (`TokenBucketBenchmark`), turnkey load-testing scripts (`k6-rate-limit.js`, `wrk-rate-limit.lua`, `run-benchmarks.sh`, `run-benchmarks.ps1`), upgraded GitHub Actions CI workflow to verify Docker image builds, and comprehensive `README.md`.
 - **2026-10-26**: **Comprehensive Systems & Security Audit**. Discovered 5 Confirmed Defects, 4 Likely Defects, 4 Potential Risks. Added `AUDIT_REPORT.md` to `.gitignore` to guarantee audit reports are never committed or pushed upstream. Planned Units 06 through 09.
 - **2026-10-26**: **Unit 06 Complete**. Hardened `TokenBucket` with 64-bit overflow protection (`tokensDeficit * NANOS_PER_SECOND`), added atomic `ConsumptionResult` snapshot API, implemented fail-fast `@PostConstruct` property validation in `RateLimiterProperties`, hardened concurrency test suite to capture asynchronous exceptions with `Future.get()`, added active token refill concurrency tests, and brought automated test suite to 48/48 passing.
+- **2026-10-26**: **Unit 07 Complete**. Remediated carrier-thread pinning in `BucketRegistry` by introducing lock-free `ConcurrentHashMap.get()` volatile fast-path + `computeIfAbsent()`, added configurable `maxActiveBuckets` memory bounds and `rate_limiter_registry_overflow_total` metric to prevent heap exhaustion (DoS), hardened multi-threaded test suite to verify asynchronous exceptions and exact quota conservation across 50 keys, and brought automated test suite to 50/50 passing.
 
 ---
 

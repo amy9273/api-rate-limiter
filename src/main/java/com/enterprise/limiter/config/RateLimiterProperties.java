@@ -38,15 +38,25 @@ public class RateLimiterProperties {
      */
     private boolean cleanupEnabled = true;
 
+    /**
+     * Maximum number of active client buckets permitted in memory to prevent heap exhaustion.
+     */
+    private int maxActiveBuckets = 100_000;
+
     public RateLimiterProperties() {
     }
 
     public RateLimiterProperties(long defaultCapacity, long defaultRefillRate, Duration bucketTtl, Duration cleanupInterval, boolean cleanupEnabled) {
+        this(defaultCapacity, defaultRefillRate, bucketTtl, cleanupInterval, cleanupEnabled, 100_000);
+    }
+
+    public RateLimiterProperties(long defaultCapacity, long defaultRefillRate, Duration bucketTtl, Duration cleanupInterval, boolean cleanupEnabled, int maxActiveBuckets) {
         this.defaultCapacity = defaultCapacity;
         this.defaultRefillRate = defaultRefillRate;
         this.bucketTtl = bucketTtl;
         this.cleanupInterval = cleanupInterval;
         this.cleanupEnabled = cleanupEnabled;
+        this.maxActiveBuckets = maxActiveBuckets;
     }
 
     public long getDefaultCapacity() {
@@ -89,6 +99,14 @@ public class RateLimiterProperties {
         this.cleanupEnabled = cleanupEnabled;
     }
 
+    public int getMaxActiveBuckets() {
+        return maxActiveBuckets;
+    }
+
+    public void setMaxActiveBuckets(int maxActiveBuckets) {
+        this.maxActiveBuckets = maxActiveBuckets;
+    }
+
     @PostConstruct
     public void validate() {
         if (defaultCapacity <= 0) {
@@ -102,6 +120,9 @@ public class RateLimiterProperties {
         }
         if (cleanupInterval == null || cleanupInterval.isNegative() || cleanupInterval.isZero()) {
             throw new IllegalArgumentException("rate-limiter.cleanup-interval must be positive: " + cleanupInterval);
+        }
+        if (maxActiveBuckets <= 0) {
+            throw new IllegalArgumentException("rate-limiter.max-active-buckets must be positive: " + maxActiveBuckets);
         }
     }
 }
