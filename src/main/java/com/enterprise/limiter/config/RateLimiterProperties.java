@@ -1,5 +1,6 @@
 package com.enterprise.limiter.config;
 
+import jakarta.annotation.PostConstruct;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -86,5 +87,21 @@ public class RateLimiterProperties {
 
     public void setCleanupEnabled(boolean cleanupEnabled) {
         this.cleanupEnabled = cleanupEnabled;
+    }
+
+    @PostConstruct
+    public void validate() {
+        if (defaultCapacity <= 0) {
+            throw new IllegalArgumentException("rate-limiter.default-capacity must be positive: " + defaultCapacity);
+        }
+        if (defaultRefillRate < 0) {
+            throw new IllegalArgumentException("rate-limiter.default-refill-rate cannot be negative: " + defaultRefillRate);
+        }
+        if (bucketTtl == null || bucketTtl.isNegative() || bucketTtl.isZero()) {
+            throw new IllegalArgumentException("rate-limiter.bucket-ttl must be positive: " + bucketTtl);
+        }
+        if (cleanupInterval == null || cleanupInterval.isNegative() || cleanupInterval.isZero()) {
+            throw new IllegalArgumentException("rate-limiter.cleanup-interval must be positive: " + cleanupInterval);
+        }
     }
 }

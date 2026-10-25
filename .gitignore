@@ -28,3 +28,6 @@ target/
 # OS Metadata
 .DS_Store
 Thumbs.db
+
+# Security & Audit Artifacts (Never push)
+AUDIT_REPORT.md

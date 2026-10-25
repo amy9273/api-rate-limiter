@@ -5,9 +5,12 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -216,6 +219,62 @@ class TokenBucketTest {
             assertThat(bucket.calculateNanosUntilNextToken()).isEqualTo(0L);
             assertThat(bucket.calculateRetryAfterSeconds()).isEqualTo(0L);
         }
+
+        @Test
+        @DisplayName("Should prevent 64-bit integer overflow on very large burst capacities")
+        void shouldNotOverflowOnLargeCapacity() {
+            // 10 billion capacity (exceeds Long.MAX_VALUE / 1_000_000_000L)
+            long largeCapacity = 10_000_000_000L;
+            TokenBucket bucket = new TokenBucket(largeCapacity, 10, 0, clock);
+
+            // Advance just 1 nanosecond: should NOT over-issue or refill 10 billion tokens!
+            clock.advanceNanos(1);
+            assertThat(bucket.getAvailableTokens())
+                    .as("Must not overflow and immediately refill full capacity")
+                    .isEqualTo(0L);
+
+            // Advance 1 full second: should refill exactly 10 tokens
+            clock.advanceSeconds(1);
+            assertThat(bucket.getAvailableTokens()).isEqualTo(10L);
+        }
+    }
+
+    @Nested
+    @DisplayName("Atomic Consumption Snapshots")
+    class AtomicSnapshotTests {
+
+        @Test
+        @DisplayName("Allowed request snapshot provides synchronized remaining tokens and zero retry-after")
+        void shouldReturnConsistentSnapshotWhenAllowed() {
+            TokenBucket bucket = new TokenBucket(10, 2, clock);
+            long epochSeconds = 1700000000L;
+
+            ConsumptionResult result = bucket.tryConsumeSnapshot(3, epochSeconds);
+
+            assertThat(result.allowed()).isTrue();
+            assertThat(result.remainingTokens()).isEqualTo(7L);
+            assertThat(result.nanosUntilNextToken()).isEqualTo(0L);
+            assertThat(result.retryAfterSeconds()).isEqualTo(0L);
+            // Deficit is 3 tokens (capacity 10 - remaining 7) at 2 tokens/sec -> ceil(3 / 2.0) = 2 seconds
+            assertThat(result.resetEpochSeconds()).isEqualTo(epochSeconds + 2L);
+        }
+
+        @Test
+        @DisplayName("Rejected request snapshot provides exact remaining tokens and non-zero retry-after")
+        void shouldReturnConsistentSnapshotWhenRejected() {
+            // Capacity 5, refill 1 token/sec, empty bucket
+            TokenBucket bucket = new TokenBucket(5, 1, 0, clock);
+            long epochSeconds = 1700000000L;
+
+            ConsumptionResult result = bucket.tryConsumeSnapshot(1, epochSeconds);
+
+            assertThat(result.allowed()).isFalse();
+            assertThat(result.remainingTokens()).isEqualTo(0L);
+            assertThat(result.nanosUntilNextToken()).isEqualTo(1_000_000_000L);
+            assertThat(result.retryAfterSeconds()).isEqualTo(1L);
+            // Deficit is 5 tokens -> 5 seconds to full
+            assertThat(result.resetEpochSeconds()).isEqualTo(epochSeconds + 5L);
+        }
     }
 
     @Nested
@@ -282,8 +341,8 @@ class TokenBucketTest {
         }
 
         @Test
-        @DisplayName("100 Virtual Threads should consume tokens concurrently with zero mutex lockups")
-        void shouldHandleVirtualThreadsWithoutLockContention() throws InterruptedException {
+        @DisplayName("100 Virtual Threads should consume tokens concurrently with zero exceptions and zero mutex lockups")
+        void shouldHandleVirtualThreadsWithoutLockContention() throws Exception {
             final int capacity = 500;
             TokenBucket bucket = new TokenBucket(capacity, 0, clock);
 
@@ -295,9 +354,10 @@ class TokenBucketTest {
 
             try (ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
                 CountDownLatch doneLatch = new CountDownLatch(threadCount);
+                List<Future<?>> futures = new ArrayList<>();
 
                 for (int i = 0; i < threadCount; i++) {
-                    virtualExecutor.submit(() -> {
+                    futures.add(virtualExecutor.submit(() -> {
                         try {
                             for (int r = 0; r < requestsPerThread; r++) {
                                 if (bucket.tryConsume()) {
@@ -309,15 +369,101 @@ class TokenBucketTest {
                         } finally {
                             doneLatch.countDown();
                         }
-                    });
+                    }));
                 }
 
                 assertThat(doneLatch.await(5, TimeUnit.SECONDS)).isTrue();
+                for (Future<?> future : futures) {
+                    future.get(5, TimeUnit.SECONDS); // Propagates any asynchronous exceptions
+                }
             }
 
             assertThat(successCount.get()).isEqualTo(500);
             assertThat(rejectCount.get()).isEqualTo(500);
             assertThat(bucket.getAvailableTokens()).isEqualTo(0);
+        }
+
+        @Test
+        @DisplayName("Atomic consumption snapshots remain strictly consistent under concurrent stampede")
+        void shouldProvideConsistentAtomicSnapshotUnderConcurrency() throws Exception {
+            final int capacity = 100;
+            TokenBucket bucket = new TokenBucket(capacity, 0, clock);
+            final int threadCount = 50;
+            final int attemptsPerThread = 4; // 200 attempts for 100 tokens
+
+            AtomicInteger allowedCount = new AtomicInteger(0);
+            AtomicInteger rejectedCount = new AtomicInteger(0);
+            AtomicInteger inconsistentSnapshots = new AtomicInteger(0);
+
+            try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<Future<?>> futures = new ArrayList<>();
+
+                for (int i = 0; i < threadCount; i++) {
+                    futures.add(executor.submit(() -> {
+                        for (int j = 0; j < attemptsPerThread; j++) {
+                            ConsumptionResult snapshot = bucket.tryConsumeSnapshot(1L);
+                            if (snapshot.allowed()) {
+                                allowedCount.incrementAndGet();
+                                if (snapshot.remainingTokens() < 0 || snapshot.retryAfterSeconds() != 0) {
+                                    inconsistentSnapshots.incrementAndGet();
+                                }
+                            } else {
+                                rejectedCount.incrementAndGet();
+                                if (snapshot.retryAfterSeconds() <= 0) {
+                                    inconsistentSnapshots.incrementAndGet();
+                                }
+                            }
+                        }
+                    }));
+                }
+
+                for (Future<?> f : futures) {
+                    f.get(5, TimeUnit.SECONDS);
+                }
+            }
+
+            assertThat(inconsistentSnapshots.get()).as("Zero inconsistent snapshots under concurrency").isEqualTo(0);
+            assertThat(allowedCount.get()).isEqualTo(100);
+            assertThat(rejectedCount.get()).isEqualTo(100);
+            assertThat(bucket.getAvailableTokens()).isEqualTo(0);
+        }
+
+        @Test
+        @DisplayName("Concurrency test with active token refilling preserves token conservation")
+        void shouldHandleConcurrentThreadsWithActiveRefill() throws Exception {
+            // Initial 10 tokens, refill 100 tokens/sec
+            TokenBucket bucket = new TokenBucket(100, 100, 10, clock);
+
+            final int threadCount = 20;
+            final int attemptsPerThread = 5;
+
+            AtomicInteger consumedTokens = new AtomicInteger(0);
+
+            try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<Future<?>> futures = new ArrayList<>();
+
+                for (int i = 0; i < threadCount; i++) {
+                    futures.add(executor.submit(() -> {
+                        for (int j = 0; j < attemptsPerThread; j++) {
+                            if (bucket.tryConsume(1L)) {
+                                consumedTokens.incrementAndGet();
+                            }
+                        }
+                    }));
+                }
+
+                for (Future<?> f : futures) {
+                    f.get(5, TimeUnit.SECONDS);
+                }
+            }
+
+            // Since clock was not advanced, exactly 10 initial tokens should have been consumed
+            assertThat(consumedTokens.get()).isEqualTo(10);
+            assertThat(bucket.getAvailableTokens()).isEqualTo(0);
+
+            // Now advance clock by 500ms -> 50 tokens refilled
+            clock.advanceMillis(500);
+            assertThat(bucket.getAvailableTokens()).isEqualTo(50);
         }
     }
 }
