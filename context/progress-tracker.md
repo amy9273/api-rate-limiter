@@ -15,7 +15,7 @@ Current project state, implementation roadmap, and completion status.
 | **Unit 05** | Production Docker, CI/CD & JMH/Load Benchmark | JMH microbenchmarks, wrk/k6 load testing script, multi-stage Dockerfile | ✅ Complete |
 | **Unit 06** | Token Bucket Hardening, Math Precision & Atomic Snapshots | Fix 64-bit overflow, atomic ConsumptionResult snapshot, safe refill math | ✅ Complete |
 | **Unit 07** | Registry Optimization & Virtual Thread Pinning Remediation | Lock-free getOrCreateEntry, eliminate carrier pinning, memory bounds | ✅ Complete |
-| **Unit 08** | Client Identity Security & Proxy Trust Chains | Trusted proxy CIDRs, X-Forwarded-For verification, key sanitization | 📋 Planned |
+| **Unit 08** | Client Identity Security & Proxy Trust Chains | Trusted proxy CIDRs, X-Forwarded-For verification, key sanitization | ✅ Complete |
 | **Unit 09** | HTTP RFC 6585/7807 Semantics & Reverse Proxy Hardening | Header synchronization, Expect header fix, JSON injection fix, safe URI | 📋 Planned |
 
 ---
@@ -31,6 +31,7 @@ Current project state, implementation roadmap, and completion status.
 - **2026-10-26**: **Comprehensive Systems & Security Audit**. Discovered 5 Confirmed Defects, 4 Likely Defects, 4 Potential Risks. Added `AUDIT_REPORT.md` to `.gitignore` to guarantee audit reports are never committed or pushed upstream. Planned Units 06 through 09.
 - **2026-10-26**: **Unit 06 Complete**. Hardened `TokenBucket` with 64-bit overflow protection (`tokensDeficit * NANOS_PER_SECOND`), added atomic `ConsumptionResult` snapshot API, implemented fail-fast `@PostConstruct` property validation in `RateLimiterProperties`, hardened concurrency test suite to capture asynchronous exceptions with `Future.get()`, added active token refill concurrency tests, and brought automated test suite to 48/48 passing.
 - **2026-10-26**: **Unit 07 Complete**. Remediated carrier-thread pinning in `BucketRegistry` by introducing lock-free `ConcurrentHashMap.get()` volatile fast-path + `computeIfAbsent()`, added configurable `maxActiveBuckets` memory bounds and `rate_limiter_registry_overflow_total` metric to prevent heap exhaustion (DoS), hardened multi-threaded test suite to verify asynchronous exceptions and exact quota conservation across 50 keys, and brought automated test suite to 50/50 passing.
+- **2026-10-26**: **Unit 08 Complete**. Remediated IP spoofing (LD-02) by enforcing trusted proxy CIDR verification for `X-Forwarded-For` with right-to-left trust chain traversal, added key sanitization to strip control characters (CWE-117) and hash oversized identifiers with SHA-256 (&le; 256 chars), added IPv4/IPv6 port stripping and zero-DNS literal checks, and brought automated test suite to 57/57 passing.
 
 ---
 
